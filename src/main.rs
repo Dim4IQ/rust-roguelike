@@ -99,6 +99,128 @@ impl Rect {
     }
 }
 
+/// combat-related properties and methods (monster, player, NPC)
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fighter {
+    max_hp: i32,
+    hp: i32,
+    defence: i32,
+    power: i32,
+    on_death: DeathCallback,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DeathCallback {
+    Player,
+    Monster,
+}
+
+impl DeathCallback {
+    fn callback(self, object: &mut Object) {
+        use DeathCallback::*;
+        let callback: fn(&mut Object) = match self {
+            Player => player_death,
+            Monster => monster_death,
+        };
+        callback(object);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Ai {
+    Basic,
+}
+
+/// This is a generic object: the player, a monster, an item, the stairs...
+/// It's always represented by a character on screen.
+#[derive(Debug)]
+struct Object {
+    x: i32,
+    y: i32,
+    char: char,
+    color: Color,
+    name: String,
+    blocks: bool,
+    alive: bool,
+    fighter: Option<Fighter>,
+    ai: Option<Ai>,
+}
+
+impl Object{
+    pub fn new(x: i32, y: i32, char: char, name: &str, color: Color, blocks: bool) -> Self{
+        Object {x, y, char, name: name.into(), color, blocks, alive: false, fighter: None, ai: None}
+    }
+
+    /// position getter
+    pub fn pos(&self) -> (i32, i32) {
+        (self.x, self.y)
+    }
+
+    /// position setter
+    pub fn set_pos(&mut self, x: i32, y: i32) {
+        self.x = x;
+        self.y = y;
+    }
+
+    /// return the distance t oanother object
+    pub fn distance_to(&self, other: &Object) -> f32 {
+        let dx = other.x - self.x;
+        let dy = other.y - self.y;
+        ((dx.pow(2) + dy.pow(2)) as f32).sqrt()
+    }
+
+    /// set the color and then draw the character that represents this object at its position
+    pub fn draw(&self, con: &mut dyn Console) {
+        con.set_default_foreground(self.color);
+        con.put_char(self.x, self.y, self.char, BackgroundFlag::None);
+    }
+
+    pub fn take_damage(&mut self, damage: i32) {
+        // apply damage if possible
+        if let Some(fighter) = self.fighter.as_mut() {
+            if damage > 0 {
+                fighter.hp -= damage;
+            }
+        }
+        // check for death, call the death function
+        if let Some(fighter) = self.fighter {
+            if fighter.hp <= 0 {
+                self.alive = false;
+                fighter.on_death.callback(self);
+            }
+        }
+    }
+
+    /// attack another object
+    pub fn attack(&self, target: &mut Object) {
+        // a simple formula for attack damage
+        let damage = self.fighter.map_or(0, |f| f.power) - target.fighter.map_or(0, |f| f.defence);
+        if damage > 0 {
+            println!("{} attacks {} for {} hit points.",
+                self.name, target.name, damage
+            );
+            target.take_damage(damage);
+        } else {
+            println!("{} attakcs {} but it has no effect!",
+                self.name, target.name
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PlayerAction {
+    TookTurn,
+    DidntTakeTurn,
+    Exit,
+}
+
+struct Tcod {
+    root: Root,
+    con: Offscreen,
+    fov: FovMap,
+}
+
 fn create_room(room: Rect, map: &mut Map) {
     // go through the tiles in the rectangle and make them passable
     for x in (room.x1 + 1)..room.x2 {
@@ -147,10 +269,30 @@ fn place_objects(room: Rect, map: &Map, objects: &mut Vec<Object>) {
             // it's free, let's create monster
             let mut monster = if rand::random::<f32>() < 0.8 { // 80% chance for orc
                 // create orc
-                Object::new(x, y, 'o', "orc", DESATURATED_GREEN, true)
+                let mut orc = Object::new(x, y, 'o', "orc", DESATURATED_GREEN, true);
+                orc.fighter = Some(Fighter {
+                    max_hp: 10,
+                    hp: 10,
+                    defence: 0,
+                    power: 3,
+                    on_death: DeathCallback::Monster,
+                });
+                orc.ai = Some(Ai::Basic);
+
+                orc
             } else {
                 // create troll
-                Object::new(x, y, 'T', "troll", DARKER_GREEN, true)
+                let mut troll = Object::new(x, y, 'T', "troll", DARKER_GREEN, true);
+                troll.fighter = Some(Fighter {
+                    max_hp: 16,
+                    hp: 16,
+                    defence: 1,
+                    power: 4,
+                    on_death: DeathCallback::Monster,
+                });
+                troll.ai = Some(Ai::Basic);
+
+                troll
             };
             
             monster.alive = true;
@@ -167,23 +309,90 @@ fn move_by(id: usize, dx: i32, dy: i32, map: &Map, objects: &mut [Object]) {
     }
 }
 
+/// Mutably borrow two *separate* elements from the given slice.
+/// Panics when the indexes are equal or out of bounds.
+fn mut_two<T>(first_index: usize, second_index: usize, items: &mut [T]) -> (&mut T, &mut T) {
+    assert_ne!(first_index, second_index);
+    let split_at_index = cmp::max(first_index, second_index);
+    let (first_slice, second_slice) = items.split_at_mut(split_at_index);
+    if first_index < second_index {
+        (&mut first_slice[first_index], &mut second_slice[0])
+    } else {
+        (&mut second_slice[0], &mut first_slice[second_index])
+    }
+}
+
 fn player_move_or_attack(dx: i32, dy: i32, game: &Game, objects: &mut [Object]) {
     // aim tile coordinates
     let new_x = objects[PLAYER].x + dx;
     let new_y = objects[PLAYER].y + dy;
 
     // try to find attackable object there
-    let target_id = objects.iter().position(|object| object.pos() == (new_x, new_y));
+    let target_id = objects
+        .iter()
+        .position(|object| object.fighter.is_some() && object.pos() == (new_x, new_y));
 
     // attack if target found, move otherwise
     match target_id {
         Some(target_id) => {
-            println!("The {} laughs at your weak attack, sucker!!!", objects[target_id].name);
+            let (player, target) = mut_two(PLAYER, target_id, objects);
+            player.attack(target);
         },
         None => {
             move_by(PLAYER, dx, dy, &game.map, objects);
         }
     }
+}
+
+fn move_towards(id: usize, target_x: i32, target_y: i32, map: &Map, objects: &mut [Object]) {
+    // vector from this object to target, and distance
+    let dx = target_x - objects[id].x;
+    let dy = target_y - objects[id].y;
+    let distance = ((dx.pow(2) + dy.pow(2)) as f32).sqrt();
+
+    // normalize it to length 1 (preserving direction), then round it and
+    // convert to integer so the movement is restricted to the map grid
+    let dx = (dx as f32 / distance).round() as i32;
+    let dy = (dy as f32 / distance).round() as i32;
+    move_by(id, dx, dy, map, objects);
+}
+
+fn ai_take_turn(monster_id: usize, tcod: &Tcod, game: &Game, objects: &mut [Object]) {
+    // a basic monster takes its turn. If you can see it, it can see you
+    let (monster_x, monster_y) = objects[monster_id].pos();
+    if tcod.fov.is_in_fov(monster_x, monster_y) {
+        if objects[monster_id].distance_to(&objects[PLAYER]) >= 2.0 {
+            // too far, move towards player
+            let (player_x, player_y) = objects[PLAYER].pos();
+            move_towards(monster_id, player_x, player_y, &game.map, objects);
+        } else if objects[PLAYER].fighter.map_or(false, |f| f.hp > 0) {
+            // close enough, attack! (if player is still alive)
+            let (monster, player) = mut_two(monster_id, PLAYER, objects);
+            monster.attack(player);
+        }
+    }
+}
+
+fn player_death(player: &mut Object) {
+    // the game ended!
+    println!("You died!");
+
+    // transform the player into corpse!
+    player.char = '%';
+    player.color = DARK_RED;
+}
+
+fn monster_death(monster: &mut Object) {
+    // transform it into a nasty corpse! it doesn't block, can't be
+    // attacked and doesn't move
+    println!("{} is dead!", monster.name);
+
+    monster.char = '%';
+    monster.color = DARK_RED;
+    monster.blocks = false;
+    monster.fighter = None;
+    monster.ai = None;
+    monster.name = format!("remains of {}", monster.name);
 }
 
 fn make_map(objects: &mut Vec<Object>) -> Map {
@@ -246,55 +455,6 @@ fn make_map(objects: &mut Vec<Object>) -> Map {
     }
 
     map
-}
-
-/// This is a generic object: the player, a monster, an item, the stairs...
-/// It's always represented by a character on screen.
-#[derive(Debug)]
-struct Object {
-    x: i32,
-    y: i32,
-    char: char,
-    color: Color,
-    name: String,
-    blocks: bool,
-    alive: bool,
-}
-
-impl Object{
-    pub fn new(x: i32, y: i32, char: char, name: &str, color: Color, blocks: bool) -> Self{
-        Object {x, y, char, name: name.into(), color, blocks, alive: false}
-    }
-
-    /// position getter
-    pub fn pos(&self) -> (i32, i32) {
-        (self.x, self.y)
-    }
-
-    /// position setter
-    pub fn set_pos(&mut self, x: i32, y: i32) {
-        self.x = x;
-        self.y = y;
-    }
-
-    /// set the color and then draw the character that represents this object at its position
-    pub fn draw(&self, con: &mut dyn Console) {
-        con.set_default_foreground(self.color);
-        con.put_char(self.x, self.y, self.char, BackgroundFlag::None);
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum PlayerAction {
-    TookTurn,
-    DidntTakeTurn,
-    Exit,
-}
-
-struct Tcod {
-    root: Root,
-    con: Offscreen,
-    fov: FovMap,
 }
 
 fn handle_keys(tcod: &mut Tcod, game: &Game, objects: &mut Vec<Object>) -> PlayerAction {
@@ -368,12 +528,16 @@ fn render_all(tcod: &mut Tcod, game: &mut Game, objects: &[Object], fov_recomput
             };
         }
     }
-
+    // pick into mutable vector only visible objects
+    let mut to_draw: Vec<_> = objects
+        .iter()
+        .filter(|o| tcod.fov.is_in_fov(o.x, o.y))
+        .collect();
+    // sort so that non-blocking objects come first
+    to_draw.sort_by(|o1, o2| { o1.blocks.cmp(&o2.blocks)});
     // draw all objects in the list
-    for object in objects{
-        if tcod.fov.is_in_fov(object.x, object.y) {
-            object.draw(&mut tcod.con);
-        }
+    for object in to_draw{
+        object.draw(&mut tcod.con);
     }
 
     // blit the contents of "con" to the root console and present it
@@ -384,6 +548,17 @@ fn render_all(tcod: &mut Tcod, game: &mut Game, objects: &[Object], fov_recomput
         (0, 0),
         1.0,
         1.0);
+    
+    // show the player's stats
+    tcod.root.set_default_foreground(WHITE);
+    if let Some(fighter) = objects[PLAYER].fighter {
+        tcod.root.print_ex(
+            1, SCREEN_HEIGHT - 2, 
+            BackgroundFlag::None, 
+            TextAlignment::Left, 
+            format!("HP: {}/{}", fighter.hp, fighter.max_hp),
+        );
+    }
 }
 
 fn main() {
@@ -405,6 +580,13 @@ fn main() {
     // create object representing the player
     let mut player = Object::new(0, 0, '@', "player", WHITE, true);
     player.alive = true;
+    player.fighter = Some(Fighter {
+        max_hp: 30,
+        hp: 30,
+        defence: 2,
+        power: 5,
+        on_death: DeathCallback::Player,
+    });
 
     // the list of game objects
     let mut objects = vec![player];
@@ -444,11 +626,12 @@ fn main() {
             break;
         }
 
+        // let monsters take their turn
         if objects[PLAYER].alive && player_action != PlayerAction::DidntTakeTurn {
-            for object in &objects {
-                // only if object is not player
-                if (object as *const _) != (&objects[PLAYER] as *const _) {
-                    println!("The {} growls!", object.name);
+            for id in 0..objects.len() {
+                // only if object has AI
+                if objects[id].ai.is_some() {
+                    ai_take_turn(id, &tcod, &game, &mut objects);
                 }
             }
         }
